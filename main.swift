@@ -1,5 +1,6 @@
 // Watched — a lightweight native macOS wrapper for watched.cx
 // - Native WebKit (fast, low memory, hardware video decode)
+// - Built-in ad/tracker blocker (toggle in View menu)
 // - Routes through Cloudflare WARP's local proxy if it's running in Proxy mode,
 //   otherwise connects directly (which is still tunneled when WARP is in normal mode)
 // - Hides the Anime section, blocks pop-ups and off-site redirects
@@ -16,6 +17,25 @@ let homeURL = URL(string: "https://watched.cx/home")!
 let allowedHosts = ["watched.cx"]
 /// Default port for WARP's local SOCKS5 proxy (`warp-cli mode proxy`).
 let warpProxyPort: UInt16 = 40000
+let blockAdsKey = "blockAds"
+
+/// Ad, pop-under and tracker networks. Blocking these is most of the speedup.
+let blockedDomains = [
+    // Google ads / analytics
+    "doubleclick.net", "googlesyndication.com", "googleadservices.com", "googletagmanager.com",
+    "googletagservices.com", "google-analytics.com", "adservice.google.com",
+    // Pop-under / redirect networks common on streaming sites
+    "popads.net", "popcash.net", "propellerads.com", "propellerclick.com", "adsterra.com",
+    "adsterratools.com", "highperformanceformat.com", "profitablecpmrate.com", "profitablegatecpm.com",
+    "effectivegatecpm.com", "monetag.com", "onclickads.net", "onclickalgo.com", "clickadu.com",
+    "hilltopads.net", "adcash.com", "exoclick.com", "exosrv.com", "juicyads.com", "trafficjunky.net",
+    "a-ads.com", "ad-maven.com", "admaven.com", "galaksion.com", "richads.com", "rollerads.com",
+    "pushame.com", "acint.net", "mgid.com", "taboola.com", "outbrain.com", "revcontent.com",
+    "bidgear.com", "yllix.com", "adskeeper.com", "clksite.com", "dtscout.com",
+    // Trackers
+    "histats.com", "mc.yandex.ru", "yandex.ru", "hotjar.com", "clarity.ms", "scorecardresearch.com",
+    "quantserve.com", "facebook.net", "amplitude.com", "mixpanel.com", "segment.io",
+]
 
 // MARK: - Helpers
 
@@ -41,23 +61,36 @@ func warpProxyAvailable() -> Bool {
     return result == 0
 }
 
-/// Hides Anime nav links and bounces any /anime page back home. Throttled to one pass per frame.
+func blockerRulesJSON() -> String {
+    let rules: [[String: Any]] = blockedDomains.map { domain in
+        let escaped = NSRegularExpression.escapedPattern(for: domain)
+        return ["trigger": ["url-filter": "^[^:]+:(//)?([^/]+\\.)?\(escaped)[/:]"],
+                "action": ["type": "block"]]
+    }
+    let data = try! JSONSerialization.data(withJSONObject: rules)
+    return String(data: data, encoding: .utf8)!
+}
+
+/// Hides Anime links with plain CSS (no per-change JavaScript, so it costs nothing while browsing).
 let hideAnimeJS = """
 (function () {
-  let queued = false;
-  function pass() {
-    queued = false;
-    document.querySelectorAll('a[href^="/anime"], a[href*="watched.cx/anime"]').forEach(function (a) {
-      var item = a.closest('li') || a;
-      item.style.setProperty('display', 'none', 'important');
-    });
-    if (/^\\/anime/i.test(location.pathname)) location.replace('/home');
-  }
-  function schedule() { if (!queued) { queued = true; requestAnimationFrame(pass); } }
-  pass();
-  new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
+  var s = document.createElement('style');
+  s.textContent = `
+    a[href^="/anime"], a[href*="watched.cx/anime"],
+    li:has(> a[href^="/anime"]), li:has(> a[href*="watched.cx/anime"]) { display: none !important; }
+  `;
+  document.documentElement.appendChild(s);
 })();
 """
+
+/// Thin loading bar along the top edge so slow loads don't look like a freeze.
+final class ProgressBar: NSView {
+    var progress: Double = 0 { didSet { needsDisplay = true } }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.controlAccentColor.setFill()
+        NSRect(x: 0, y: 0, width: bounds.width * progress, height: bounds.height).fill()
+    }
+}
 
 // MARK: - App
 
@@ -65,9 +98,17 @@ let hideAnimeJS = """
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
     var window: NSWindow!
     var webView: WKWebView!
+    let progressBar = ProgressBar()
+    var observers: [NSKeyValueObservation] = []
+    var blockerList: WKContentRuleList?
+    var blockMenuItem: NSMenuItem!
     var routeLabel = "direct"
 
+    var blockAds: Bool { UserDefaults.standard.bool(forKey: blockAdsKey) }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UserDefaults.standard.register(defaults: [blockAdsKey: true])
+
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()            // persistent cache + logins
         config.preferences.isElementFullscreenEnabled = true
@@ -81,8 +122,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             routeLabel = "via WARP proxy"
         }
 
-        let script = WKUserScript(source: hideAnimeJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
-        config.userContentController.addUserScript(script)
+        config.userContentController.addUserScript(
+            WKUserScript(source: hideAnimeJS, injectionTime: .atDocumentStart, forMainFrameOnly: true))
 
         webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self
@@ -95,17 +136,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                           backing: .buffered, defer: false)
         window.titlebarAppearsTransparent = true
         window.title = "Watched — \(routeLabel)"
-        window.contentView = webView
+
+        let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
+        webView.frame = container.bounds
+        webView.autoresizingMask = [.width, .height]
+        container.addSubview(webView)
+        progressBar.frame = NSRect(x: 0, y: container.bounds.height - 3, width: container.bounds.width, height: 3)
+        progressBar.autoresizingMask = [.width, .minYMargin]
+        container.addSubview(progressBar)
+        window.contentView = container
+
         window.center()
         window.setFrameAutosaveName("WatchedMainWindow")
         window.makeKeyAndOrderFront(nil)
 
+        observers.append(webView.observe(\.estimatedProgress, options: [.new]) { [weak self] wv, _ in
+            Task { @MainActor in self?.updateProgress(wv.estimatedProgress) }
+        })
+        // Catches in-page (single-page-app) route changes that never fire a navigation.
+        observers.append(webView.observe(\.url, options: [.new]) { [weak self] wv, _ in
+            Task { @MainActor in self?.redirectIfAnime(wv.url) }
+        })
+
         buildMenu()
-        webView.load(URLRequest(url: homeURL))
         NSApp.activate(ignoringOtherApps: true)
+
+        Task { @MainActor in
+            await self.loadBlocker()
+            self.webView.load(URLRequest(url: homeURL))
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    // MARK: Ad blocking
+
+    func loadBlocker() async {
+        if blockerList == nil {
+            blockerList = try? await WKContentRuleListStore.default()
+                .compileContentRuleList(forIdentifier: "WatchedBlocker", encodedContentRuleList: blockerRulesJSON())
+        }
+        let ucc = webView.configuration.userContentController
+        ucc.removeAllContentRuleLists()
+        if blockAds, let list = blockerList { ucc.add(list) }
+    }
+
+    @objc func toggleBlockAds(_ sender: NSMenuItem) {
+        UserDefaults.standard.set(!blockAds, forKey: blockAdsKey)
+        sender.state = blockAds ? .on : .off
+        Task { @MainActor in
+            await self.loadBlocker()
+            self.webView.reload()
+        }
+    }
+
+    // MARK: Progress / routing
+
+    func updateProgress(_ p: Double) {
+        progressBar.progress = p
+        progressBar.isHidden = p >= 1.0
+    }
+
+    func redirectIfAnime(_ url: URL?) {
+        guard let url, let host = url.host, isAllowedHost(host) else { return }
+        if url.path.lowercased().hasPrefix("/anime") { webView.load(URLRequest(url: homeURL)) }
+    }
+
+    // MARK: Navigation policy
 
     // Only let the main frame go to allowed hosts (blocks ad redirects). Player iframes are untouched.
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
@@ -170,6 +267,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             item.target = self
             viewMenu.addItem(item)
         }
+        viewMenu.addItem(.separator())
+        blockMenuItem = NSMenuItem(title: "Block Ads & Trackers", action: #selector(toggleBlockAds(_:)), keyEquivalent: "")
+        blockMenuItem.target = self
+        blockMenuItem.state = blockAds ? .on : .off
+        viewMenu.addItem(blockMenuItem)
         viewMenu.addItem(.separator())
         let fs = NSMenuItem(title: "Toggle Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
         fs.keyEquivalentModifierMask = [.command, .control]
