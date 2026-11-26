@@ -5,6 +5,7 @@ A lightweight native macOS wrapper for watched.cx, built on WebKit.
 - Fast and light: uses the system WebKit engine (no bundled Chromium), hardware video decode, persistent cache and login
 - Routes through Cloudflare WARP: if WARP is in Proxy mode (`warp-cli mode proxy`, port 40000) the app uses it automatically; in normal WARP mode all traffic is already tunneled
 - Built-in ad & tracker blocker (View → Block Ads & Trackers), plus a loading bar
+- Cast with Chrome (⌘⇧C): opens the current page in Chrome, since Chromecast only works through Chrome
 - Hides the Anime section
 - Blocks pop-ups and off-site redirects
 - Window title shows the route in use ("via WARP proxy" or "direct")
@@ -24,4 +25,4 @@ Requires macOS 14+ and Xcode Command Line Tools.
 
 ## Shortcuts
 
-⌘⇧H Home · ⌘R Reload · ⌘[ Back · ⌘] Forward · ⌃⌘F Full screen
+⌘⇧H Home · ⌘R Reload · ⌘[ Back · ⌘] Forward · ⌃⌘F Full screen · ⌘⇧C Cast with Chrome

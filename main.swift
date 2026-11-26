@@ -231,6 +231,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         window.title = "Watched — couldn't load (\(routeLabel)). Is WARP connected?"
     }
 
+    /// Chromecast only works through Chrome's built-in Cast support, which WebKit doesn't have.
+    /// This hands the current page to Chrome so the site's Cast button works there.
+    @objc func castWithChrome(_ sender: Any?) {
+        let url = webView.url ?? homeURL
+        guard let chrome = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.Chrome") else {
+            let alert = NSAlert()
+            alert.messageText = "Google Chrome isn't installed"
+            alert.informativeText = "Chromecast needs Chrome's built-in Cast support. Install Chrome, then try again."
+            alert.runModal()
+            return
+        }
+        webView.evaluateJavaScript("document.querySelectorAll('video').forEach(v => v.pause())")
+        NSWorkspace.shared.open([url], withApplicationAt: chrome, configuration: NSWorkspace.OpenConfiguration())
+    }
+
     @objc func goHome(_ sender: Any?) { webView.load(URLRequest(url: homeURL)) }
     @objc func reloadPage(_ sender: Any?) { webView.reload() }
     @objc func back(_ sender: Any?) { webView.goBack() }
@@ -267,6 +282,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             item.target = self
             viewMenu.addItem(item)
         }
+        viewMenu.addItem(.separator())
+        let cast = NSMenuItem(title: "Cast with Chrome…", action: #selector(castWithChrome(_:)), keyEquivalent: "C")
+        cast.target = self
+        viewMenu.addItem(cast)
         viewMenu.addItem(.separator())
         blockMenuItem = NSMenuItem(title: "Block Ads & Trackers", action: #selector(toggleBlockAds(_:)), keyEquivalent: "")
         blockMenuItem.target = self
